@@ -2,3 +2,5 @@
 Comparison of LCMV-infected endothelial cells with the steady state counterpart in brain and liver.
 
 RNA counts data: [here](https://z1vgy-my.sharepoint.com/:u:/g/personal/truc0303_z1vgy_onmicrosoft_com/ETl6PkOmk2JNsGQ7mB5wJSwBdm2Z1BgbbKAnekUagzAOBg?e=rCizhx)
+
+SRR11256378 fastq (Emma): [here](https://drive.google.com/file/d/1ywMJaQncTdpIakmwGBkn2INk4Alozihl/view?usp=drive_link)
