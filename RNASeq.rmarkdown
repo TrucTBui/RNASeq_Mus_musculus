@@ -14,7 +14,11 @@ editor_options:
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+
+
 # Load packages and Data
+
+
 
 ```{r warning=FALSE, message=FALSE}
 library(dplyr)
@@ -71,13 +75,21 @@ meta_genes <- getBM(attributes = c("mgi_symbol",
 expr <- expr[meta_genes$uniprot_gn_id,]
 ```
 
+
+
 # Comparison across samples
+
+
 
 ```{r}
 dim(expr)
 ```
 
+
+
 ## Check average expression levels
+
+
 
 ```{r}
 avg_expr <- rowMeans(expr)
@@ -94,16 +106,24 @@ ggplot(data.frame(avg_expr), aes(x=avg_expr)) +
   theme_minimal()
 ```
 
+
+
 The y-axis is dominated by the very first bin which includes all the unexpressed genes. Therefore, we need to do a log-transformation on the y-axis.
 
 ## Check in how many samples each gene is detected
+
+
 
 ```{r}
 num_det <- rowSums(expr > 0)
 hist(num_det)
 ```
 
+
+
 Here we are going to use the threshold of 1) being detected in at least half of the samples, or 2) average TPM\>=1, to define whether a gene is expressed or not.
+
+
 
 ```{r}
 expressed <- rowMeans(expr > 0) >= 0.5 | rowMeans(expr) >= 1
@@ -114,7 +134,11 @@ meta_genes$expressed <- expressed
 sum(meta_genes$expressed==T)
 ```
 
+
+
 ## Calculate correlation
+
+
 
 ```{r}
 corr_pearson <- cor(log1p(expr[meta_genes$expressed,]))
@@ -131,7 +155,11 @@ plot(hcl_spearman, labels = meta$condition)
 layout(matrix(1:1,nrow=1))
 ```
 
+
+
 ## PCA
+
+
 
 ```{r}
 pca <- prcomp(log1p(t(expr[meta_genes$expressed,])), center = TRUE, scale. = TRUE)
@@ -150,7 +178,11 @@ ggplot(data.frame(pca$x, meta)) +
   geom_point(aes(x = PC1, y = PC2, color = condition, shape = Organ), size = 5)
 ```
 
+
+
 ### **Highly variable genes identification**
+
+
 
 ```{r}
 estimate_variability <- function(expr){
@@ -184,7 +216,11 @@ estimate_variability <- function(expr){
 }
 ```
 
+
+
 ### Test for significance of overdispersion:
+
+
 
 ```{r}
 var_genes <- estimate_variability(expr[meta_genes$expressed,])
@@ -205,11 +241,15 @@ ggplot(data.frame(pca_highvar$x, meta)) +
   geom_point(aes(x = PC1, y = PC2, color = condition, shape = Organ), size = 5)
 ```
 
+
+
 The PCA plot is not better in this case.
 
 # **Differential expression analysis**
 
 ## First approach (ANOVA)
+
+
 
 ```{r}
 DE_test <- function(expr,
@@ -261,9 +301,13 @@ ggplot(res_DE, aes(x = log(fc), y = -log10(padj), col=DE, label=DEG)) +
   theme_minimal()
 ```
 
+
+
 The DEG are: A0A0A6YY53, P05533, G3UWN9.
 
 ## **DESeq2**
+
+
 
 ```{r}
 tx2gene <- getBM(attributes = c("uniprot_gn_id","ensembl_transcript_id_version",
@@ -281,7 +325,11 @@ dds <- DESeqDataSetFromTximport(txi,
                                  design = ~group)
 ```
 
+
+
 Apply expression threshold filtering to the object by subsetting only those we consider as expressed above
+
+
 
 ```{r}
 abundances <- txi$abundance
@@ -378,18 +426,26 @@ smoothScatter(-log10(combined_res$pvalue),
               xlab = "-log10(pval DESeq2)", ylab = "-log10(pval DE)", pch=16)
 ```
 
+
+
 Our analysis showed that the two DE methods produced results with almost zero correlation. This confirms that the statistical model is critical, and the `DESeq2` results, which are based on a model specifically designed for raw counts, are the more statistically appropriate choice.
+
+
 
 ```{r}
 table(p.adjust(combined_res$pvalue, method="bonferroni") < 0.1,
       p.adjust(combined_res$pval, method="bonferroni") < 0.1)
 ```
 
+
+
 **Striking results(!!)**
 
 ## **Grouping of the identified DEGs**
 
 We proceed with the results from DESeq2
+
+
 
 ```{r}
 # Find both up and down genes
@@ -419,7 +475,11 @@ for(group in names(scaled_expr_DEG_list)){
 layout(matrix(1, ncol=1))
 ```
 
+
+
 ## Clustering
+
+
 
 ```{r}
 corr_DEG <- cor(t(avg_expr), method = "spearman")
@@ -459,9 +519,13 @@ pheatmap(corr_DEG,
 unique(cl_DEG[hcl_DEG$order])
 ```
 
+
+
 ## **Making sense of the genes**
 
 ### **Enrichment analysis: frequency comparison (DAVID)**
+
+
 
 ```{r}
 write.table(names(which(cl_DEG==2)),
@@ -489,12 +553,17 @@ table_c5 <- fread("DAVIDChartReport_genes_C5_2025-11-05.csv")
 head(table_c5)
 ```
 
+
+
 ### **Enrichment analysis: rank distribution comparison**
 
 TODO?
+
+
 
 ```{r}
 res_DESeq2_df <- res_DESeq2_df %>% arrange(padj, desc(abs(log2FoldChange)))
 write.table(res_DESeq2_df,
             file = "res_DESeq2.txt", row.names = F)
 ```
+
