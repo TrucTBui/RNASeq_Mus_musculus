@@ -8,6 +8,8 @@ format:
         toc: true
 editor_options: 
     chunk_output_type: console
+execute:
+  cache: true
 ---
 
 ```{r setup, include=FALSE}
@@ -27,6 +29,8 @@ library(tximport)
 library(DESeq2)
 library(gplots)
 library(data.table)
+library(UpSetR)
+library(pheatmap)
 ```
 
 ```{r}
@@ -263,7 +267,7 @@ ggplot(res_DE, aes(x = log(fc), y = -log10(padj), col=DE, label=DEG)) +
 
 The DEG are: A0A0A6YY53, P05533, G3UWN9.
 
-## **DESeq2**
+## **DESeq2 (Main work!)**
 
 ```{r}
 tx2gene <- getBM(attributes = c("uniprot_gn_id","ensembl_transcript_id_version",
@@ -276,9 +280,7 @@ tx2gene <- getBM(attributes = c("uniprot_gn_id","ensembl_transcript_id_version",
 files <- file.path("rsem", samples, paste0(samples,".isoforms.results"))
 txi <- tximport(files, type = "rsem", tx2gene = tx2gene)
 
-dds <- DESeqDataSetFromTximport(txi,
-                                 colData = meta,
-                                 design = ~group)
+dds <- DESeqDataSetFromTximport(txi, colData = meta, design = ~ Organ + condition)
 ```
 
 Apply expression threshold filtering to the object by subsetting only those we consider as expressed above
@@ -290,80 +292,133 @@ expressed_dds <- rowMeans(abundances > 0) >= 0.5 | rowMeans(abundances) >= 1
 dds_filtered <- dds[which(expressed_dds), ]
 ```
 
+Run DESeq2 using different approaches:
+
 ```{r}
-dds_filtered <- DESeq(dds_filtered)
-res_DESeq2 <- results(dds_filtered)
+# organ effect
+design(dds_filtered) <- ~ Organ + condition
+dds_org <- DESeq(dds_filtered, test = "LRT", reduced = ~ condition)
+res_org <- results(dds_org)
+res_org_df <- as.data.frame(res_org) %>% tibble::rownames_to_column("gene_ensembl_ID")
+
+# condition effect
+design(dds_filtered) <- ~ Organ + condition
+dds_cond <- DESeq(dds_filtered, test = "LRT", reduced = ~ Organ)
+res_cond <- results(dds_cond)
+res_cond_df <- as.data.frame(res_cond) %>% tibble::rownames_to_column("gene_ensembl_ID")
+
+# interaction effect
+design(dds_filtered) <- ~ Organ + condition + Organ:condition
+dds_int <- DESeq(dds_filtered, test = "LRT", reduced = ~ Organ + condition)
+res_int <- results(dds_int)
+res_int_df <- as.data.frame(res_int) %>% tibble::rownames_to_column("gene_ensembl_ID")
 ```
 
 ```{r}
-res_DESeq2 <- res_DESeq2[order(res_DESeq2$padj), ]
-head(res_DESeq2)
+plot_volcano <- function(res_DESeq2_df) {
+
+  res_DESeq2_df$gene <- meta_genes$mgi_symbol[match(res_DESeq2_df$gene_ensembl_ID,
+                                                    meta_genes$ensembl_gene_id)]
+  
+  padj_threshold <- 0.05
+  lfc_threshold <- 1.5 
+  
+  top_10_up <- res_DESeq2_df %>%
+    filter(padj < padj_threshold & log2FoldChange > lfc_threshold) %>%
+    slice_min(order_by = padj, n = 5) %>%
+    pull(gene) 
+  
+  top_10_down <- res_DESeq2_df %>%
+    filter(padj < padj_threshold & log2FoldChange < -lfc_threshold) %>%
+    slice_min(order_by = padj, n = 5) %>%
+    pull(gene)
+  
+  genes_to_label <- c(top_10_up, top_10_down)
+  
+  plot_df <- res_DESeq2_df %>%
+    mutate(
+      DE_group = case_when(
+        padj < padj_threshold & log2FoldChange > lfc_threshold  ~ "Up-regulated",
+        padj < padj_threshold & log2FoldChange < -lfc_threshold ~ "Down-regulated",
+        TRUE                                                  ~ "Not Significant"
+      ),
+      # Create the new label column
+      DEG_label = ifelse(gene %in% genes_to_label, gene, NA_character_)
+    )
+  
+  ggplot(plot_df, aes(x = log2FoldChange, y = -log10(padj), col = DE_group, label = DEG_label)) +
+    geom_point(aes(color = DE_group), size = 1.5) +
+    
+    geom_text_repel(
+        max.overlaps = Inf, # Allow labels to overlap, but ggrepel will try its best
+        box.padding = 0.5,
+        point.padding = 0.2,
+        segment.color = 'grey50'
+    ) +
+    
+    geom_vline(xintercept = c(-lfc_threshold, lfc_threshold), col = "gray", linetype = "dotted") +
+    geom_hline(yintercept = -log10(padj_threshold), col = "gray", linetype = "dotted") +
+    
+    scale_color_manual(values = c(
+      "Down-regulated" = "blue", 
+      "Not Significant" = "grey80",
+      "Up-regulated" = "red"
+    )) +
+    
+    theme_minimal() +
+    labs(
+      title = "Volcano Plot",
+      x = "log2 Fold Change",
+      y = "-log10 (Adjusted P-value)"
+    ) +
+    theme(legend.title = element_blank())
+}
 ```
 
 ```{r}
-res_DESeq2_df <- as.data.frame(res_DESeq2) %>%
-  tibble::rownames_to_column("gene_ensembl_ID")
+plot_volcano(res_org_df)
+plot_volcano(res_cond_df)
+plot_volcano(res_int_df)
+```
 
-res_DESeq2_df$gene <- meta_genes$mgi_symbol[match(res_DESeq2_df$gene_ensembl_ID, meta_genes$ensembl_gene_id)]
+```{r}
+vsd <- vst(dds_filtered)
 
-padj_threshold <- 0.05
-lfc_threshold <- 1.5 
+# Function to plot top N genes
+plot_heatmap <- function(vsd, DESeq2res_df, title){
+  top_genes <- DESeq2res_df %>% filter(padj < 0.05) %>% 
+    arrange(desc(abs(log2FoldChange))) %>% 
+    head(50)
+  mat <- assay(vsd)[top_genes$gene_ensembl_ID, ]
+  mat <- mat - rowMeans(mat)
+  pheatmap(mat,
+           annotation_col = as.data.frame(colData(vsd)[, c("Organ", "condition")]),
+           show_rownames = FALSE,
+           main = title)
+}
+```
 
-top_10_up <- res_DESeq2_df %>%
-  filter(padj < padj_threshold & log2FoldChange > lfc_threshold) %>%
-  slice_min(order_by = padj, n = 5) %>%
-  pull(gene) 
+```{r}
+plot_heatmap(vsd, res_org_df,  "Top 50 Organ-effect genes")
+plot_heatmap(vsd, res_cond_df, "Top 50 Condition-effect genes")
+plot_heatmap(vsd, res_int_df,  "Top 50 Interaction-effect genes")
+```
 
-top_10_down <- res_DESeq2_df %>%
-  filter(padj < padj_threshold & log2FoldChange < -lfc_threshold) %>%
-  slice_min(order_by = padj, n = 5) %>%
-  pull(gene)
+This shows how many genes are uniquely driven by organ, condition, or interaction effects, and how much they overlap.
 
-genes_to_label <- c(top_10_up, top_10_down)
+```{r}
+sig_sets <- list(
+  Organ = res_org_df %>% filter(padj < 0.05) %>% pull(gene_ensembl_ID),
+  Condition = res_cond_df %>% filter(padj < 0.05) %>% pull(gene_ensembl_ID),
+  Interaction = res_int_df %>% filter(padj < 0.05) %>% pull(gene_ensembl_ID)
+)
 
-plot_df <- res_DESeq2_df %>%
-  mutate(
-    DE_group = case_when(
-      padj < padj_threshold & log2FoldChange > lfc_threshold  ~ "Up-regulated",
-      padj < padj_threshold & log2FoldChange < -lfc_threshold ~ "Down-regulated",
-      TRUE                                                  ~ "Not Significant"
-    ),
-    # Create the new label column
-    DEG_label = ifelse(gene %in% genes_to_label, gene, NA_character_)
-  )
-
-ggplot(plot_df, aes(x = log2FoldChange, y = -log10(padj), col = DE_group, label = DEG_label)) +
-  geom_point(aes(color = DE_group), size = 1.5) +
-  
-  geom_text_repel(
-      max.overlaps = Inf, # Allow labels to overlap, but ggrepel will try its best
-      box.padding = 0.5,
-      point.padding = 0.2,
-      segment.color = 'grey50'
-  ) +
-  
-  geom_vline(xintercept = c(-lfc_threshold, lfc_threshold), col = "gray", linetype = "dotted") +
-  geom_hline(yintercept = -log10(padj_threshold), col = "gray", linetype = "dotted") +
-  
-  scale_color_manual(values = c(
-    "Down-regulated" = "blue", 
-    "Not Significant" = "grey80",
-    "Up-regulated" = "red"
-  )) +
-  
-  theme_minimal() +
-  labs(
-    title = "Volcano Plot",
-    x = "log2 Fold Change",
-    y = "-log10 (Adjusted P-value)"
-  ) +
-  theme(legend.title = element_blank())
+fromList(sig_sets) %>% upset()
 ```
 
 ```{r}
 res_DE$gene_ensembl_ID <- meta_genes$ensembl_gene_id[match(res_DE$gene, meta_genes$uniprot_gn_id)]
-
-combined_res <- dplyr::inner_join(res_DESeq2_df, res_DE, by="gene_ensembl_ID")
+combined_res <- dplyr::inner_join(res_cond_df, res_DE, by="gene_ensembl_ID")
 
 cor(combined_res$padj.x, combined_res$padj.y, 
     method = "spearman", 
@@ -394,11 +449,11 @@ We proceed with the results from DESeq2
 ```{r}
 # Find both up and down genes
 lfc_threshold <- 1.5 
-padj_threshold <- 0.03
+padj_threshold <- 0.05
 
-res_DESeq2_df$DE <- res_DESeq2_df$padj < padj_threshold & 
-                    abs(res_DESeq2_df$log2FoldChange) > lfc_threshold
-DEG <- res_DESeq2_df$gene_ensembl_ID[which(res_DESeq2_df$DE)]
+res_int_df$DE <- res_int_df$padj < padj_threshold & 
+                    abs(res_int_df$log2FoldChange) > lfc_threshold
+DEG <- res_int_df$gene_ensembl_ID[which(res_int_df$DE)]
 
 avg_expr <- sapply(sort(unique(meta$group)), function(g) {
   rowMeans(abundances[DEG, which(meta$group == g), drop = FALSE])
@@ -464,29 +519,29 @@ unique(cl_DEG[hcl_DEG$order])
 ### **Enrichment analysis: frequency comparison (DAVID)**
 
 ```{r}
-write.table(names(which(cl_DEG==2)),
-            file = "genes_C2.txt",
-            quote = F, row.names = F, col.names = F)
-write.table(names(which(cl_DEG==4)),
-            file = "genes_C4.txt",
-            quote = F, row.names = F, col.names = F)
-write.table(names(which(cl_DEG==5)),
-            file = "genes_C5.txt",
-            quote = F, row.names = F, col.names = F)
-write.table(meta_genes[meta_genes$expressed, "ensembl_gene_id"],
-            file = "genes_expressed.txt",
-            quote = F, row.names = F, col.names = F)
+# write.table(names(which(cl_DEG==2)),
+#             file = "genes_C2.txt",
+#             quote = F, row.names = F, col.names = F)
+# write.table(names(which(cl_DEG==4)),
+#             file = "genes_C4.txt",
+#             quote = F, row.names = F, col.names = F)
+# write.table(names(which(cl_DEG==5)),
+#             file = "genes_C5.txt",
+#             quote = F, row.names = F, col.names = F)
+# write.table(meta_genes[meta_genes$expressed, "ensembl_gene_id"],
+#             file = "genes_expressed.txt",
+#             quote = F, row.names = F, col.names = F)
 ```
 
 ```{r}
-table_c2 <- fread("DAVIDChartReport_genes_C2_2025-11-06.csv")
-head(table_c2)
-
-table_c4 <- fread("DAVIDChartReport_genes_C4_2025-11-05.csv")
-head(table_c4)
-
-table_c5 <- fread("DAVIDChartReport_genes_C5_2025-11-05.csv")
-head(table_c5)
+# table_c2 <- fread("DAVIDChartReport_genes_C2_2025-11-06.csv")
+# head(table_c2)
+# 
+# table_c4 <- fread("DAVIDChartReport_genes_C4_2025-11-05.csv")
+# head(table_c4)
+# 
+# table_c5 <- fread("DAVIDChartReport_genes_C5_2025-11-05.csv")
+# head(table_c5)
 ```
 
 ### **Enrichment analysis: rank distribution comparison**
@@ -494,7 +549,7 @@ head(table_c5)
 TODO?
 
 ```{r}
-res_DESeq2_df <- res_DESeq2_df %>% arrange(padj, desc(abs(log2FoldChange)))
-write.table(res_DESeq2_df,
-            file = "res_DESeq2.txt", row.names = F)
+# res_DESeq2_df <- res_DESeq2_df %>% arrange(padj, desc(abs(log2FoldChange)))
+# write.table(res_DESeq2_df,
+#             file = "res_DESeq2.txt", row.names = F)
 ```
