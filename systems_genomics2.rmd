@@ -1,0 +1,654 @@
+---
+title: "systems_genomics"
+output: html_document
+date: "2025-11-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+
+# --- Consolidated Libraries ---
+library(tidyverse)
+library(ggplot2)
+library(biomaRt)
+library(dplyr)
+library(viridis)
+library(gplots)
+library(sva)
+library(DESeq2)
+library(ggrepel)
+library(tximport)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(ggvenn)
+```
+
+
+```{r}
+# ============================================================================
+# 1. CREATE METADATA
+# ============================================================================
+cat("Step 1: Creating metadata from SRA information...\n")
+
+metadata <- data.frame(
+  Run = c("SRR11256286", "SRR11256287", "SRR11256288", "SRR11256289", 
+          "SRR11256290", "SRR11256291", "SRR11256373", "SRR11256374",
+          "SRR11256375", "SRR11256376", "SRR11256377", "SRR11256378"),
+  Sample.Name = c("SAMN14322546", "SAMN14322545", "SAMN14322544", "SAMN14322543",
+                  "SAMN14322542", "SAMN14322541", "SAMN14322680", "SAMN14322679",
+                  "SAMN14322678", "SAMN14322677", "SAMN14322676", "SAMN14322675"),
+  Organ = c("Brain", "Brain", "Brain", "Brain", "Brain", "Brain",
+            "Liver", "Liver", "Liver", "Liver", "Liver", "Liver"),
+  Condition = c("LCMVd8", "LCMVd8", "LCMVd8", "steady_state", "steady_state", "steady_state",
+                "LCMVd8", "LCMVd8", "LCMVd8", "steady_state", "steady_state", "steady_state"),
+  cell_type = rep("GP38negCD31pos", 12),
+  GEO_Accession = c("GSM4395838", "GSM4395839", "GSM4395840", "GSM4395841",
+                    "GSM4395842", "GSM4395843", "GSM4395925", "GSM4395926",
+                    "GSM4395927", "GSM4395928", "GSM4395929", "GSM4395930")
+)
+
+write.table(metadata, file = "SraRunTable.txt", 
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+cat(sprintf("✓ Created metadata for %d samples\n", nrow(metadata)))
+
+
+```
+
+
+```{r}
+# ============================================================================
+# 2. IMPORT RSEM QUANTIFICATION DATA
+# ============================================================================
+cat("\nStep 2: Loading RSEM quantification data...\n")
+
+sample_ids <- metadata$Run
+
+expr <- sapply(sample_ids, function(sample_id){
+  file <- file.path("rsem", sample_id, paste0(sample_id, ".genes.results"))
+  if (!file.exists(file)) {
+    warning(sprintf("File not found: %s", file))
+    return(NA)
+  }
+  quant <- read.csv(file, sep="\t", header=TRUE, stringsAsFactors=FALSE)
+  tpm <- setNames(quant$TPM, quant$gene_id)
+  return(tpm)
+})
+
+colnames(expr) <- sample_ids
+meta <- metadata # Use 'meta' as the clean metadata object
+cat(sprintf("✓ Loaded expression data: %d genes x %d samples\n", nrow(expr), ncol(expr)))
+
+```
+
+```{r}
+# ============================================================================
+# 3. GET GENE ANNOTATIONS FROM ENSEMBL
+# ============================================================================
+cat("\nStep 3: Getting gene annotations from Ensembl...\n")
+
+original_gene_ids <- rownames(expr)
+cat(sprintf("Mapping %d UniProt IDs (e.g., %s)...\n", 
+            length(original_gene_ids), original_gene_ids[1]))
+
+ensembl <- useEnsembl(biomart = "ensembl", dataset = "mmusculus_gene_ensembl")
+
+meta_genes <- getBM(
+  attributes = c("ensembl_gene_id", "mgi_symbol", "description", 
+                 "chromosome_name", "start_position", "end_position", 
+                 "strand", "uniprot_gn_id"),
+  filters = "uniprot_gn_id",
+  values = original_gene_ids,
+  mart = ensembl
+)
+
+cat(sprintf("Retrieved annotations for %d gene entries\n", nrow(meta_genes)))
+
+if (nrow(meta_genes) == 0) {
+  warning("No genes found. Check your UniProt IDs and mart connection.")
+  meta_genes <- data.frame(uniprot_gn_id = original_gene_ids)
+} else {
+  meta_genes <- meta_genes %>%
+    right_join(data.frame(uniprot_gn_id = original_gene_ids), by = "uniprot_gn_id") %>%
+    distinct(uniprot_gn_id, .keep_all = TRUE)
+}
+
+# Reorder expression matrix to match gene metadata
+expr <- expr[meta_genes$uniprot_gn_id, ]
+rownames(meta_genes) <- meta_genes$uniprot_gn_id
+cat(sprintf("✓ Final metadata table has %d entries\n", nrow(meta_genes)))
+
+
+```
+
+
+```{r}
+# ============================================================================
+# 4. FILTER LOW-EXPRESSION GENES
+# ============================================================================
+cat("\nStep 4: Filtering low-expression genes...\n")
+
+num_samples_detected <- rowSums(expr > 0)
+avg_tpm <- rowMeans(expr)
+
+# Keep genes detected in at least 50% of samples OR average TPM >= 1
+keep_genes <- (num_samples_detected >= (ncol(expr) / 2)) | (avg_tpm >= 1)
+
+cat(sprintf("  Initial gene count: %d\n", nrow(expr)))
+cat(sprintf("  Kept %d 'expressed' genes\n", sum(keep_genes)))
+
+# Create new filtered data frames
+expr_filtered <- expr[keep_genes, ]
+meta_genes_filtered <- meta_genes[keep_genes, ]
+
+cat(sprintf("✓ Created filtered matrix: %d genes x %d samples\n", 
+            nrow(expr_filtered), ncol(expr_filtered)))
+
+
+```
+
+```{r}
+# ============================================================================
+# 5. POST-FILTERING DATA EXPLORATION
+# ============================================================================
+cat("\nStep 5: Plotting post-filtering expression distribution...\n")
+
+plot_data <- data.frame(avg_tpm = rowMeans(expr_filtered))
+
+# ggplot histogram with log-transformed axes
+ggplot(plot_data, aes(x = avg_tpm)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "black") +
+  scale_x_continuous(trans = "log1p", 
+                     breaks = c(0, 1, 10, 100, 1000, 10000)) +
+  scale_y_continuous(trans = "log1p") +
+  labs(title = "Distribution of Average Gene Expression (Filtered)",
+       x = "Average TPM (Log10 Scale)",
+       y = "Number of Genes (Log10 Scale)") +
+  theme_minimal()
+
+```
+
+```{r}
+# ============================================================================
+# 6. SAMPLE CORRELATION & HEATMAP
+# ============================================================================
+cat("\nStep 6: Calculating sample correlations and plotting heatmap...\n")
+
+# Spearman correlation on ranks (no log-transform needed)
+corr_spearman <- cor(expr_filtered, method = "spearman")
+
+# Hierarchical clustering
+hcl_spearman <- hclust(as.dist(1 - corr_spearman))
+
+# Create custom labels for heatmap
+custom_labels <- paste(meta$Organ, meta$Condition, sep = "_")
+
+# Create the heatmap
+heatmap.2(corr_spearman,
+          Rowv = as.dendrogram(hcl_spearman), 
+          Colv = as.dendrogram(hcl_spearman), 
+          col = viridis(100),                 
+          main = "Sample Correlation (Spearman)",
+          trace = "none",                     
+          margins = c(8, 8),                  
+          labRow = custom_labels,
+          labCol = custom_labels,
+          cexRow = 0.8,                       
+          cexCol = 0.8
+)
+cat("✓ Correlation heatmap generated.\n")
+
+```
+
+
+```{r}
+# ============================================================================
+# 7. PRINCIPAL COMPONENT ANALYSIS (PCA) - BEFORE CORRECTION
+# ============================================================================
+cat("\nStep 7: Running PCA before batch correction...\n")
+
+# Run PCA on log-transformed, filtered data
+# Samples must be rows, so we transpose with t()
+pca <- prcomp(log1p(t(expr_filtered)), center = TRUE, scale. = TRUE)
+
+# Combine PCA coordinates with metadata for plotting
+pca_data <- data.frame(pca$x, meta)
+
+# Create the PCA scatter plot
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Condition, shape = Organ)) +
+  geom_point(size = 5) +
+  theme_minimal() +
+  labs(title = "PCA Before Batch Correction",
+       subtitle = "Samples cluster strongly by 'Organ' (shape)",
+       x = "Principal Component 1 (PC1)",
+       y = "Principal Component 2 (PC2)")
+
+cat("✓ Pre-correction PCA plot generated.\n")
+
+
+```
+
+
+```{r}
+# ============================================================================
+# 8. BATCH EFFECT CORRECTION (ComBat)
+# ============================================================================
+cat("\nStep 8: Running Batch Effect Correction (ComBat)...\n")
+
+# Run ComBat using 'Organ' as the batch variable
+# We use the log-transformed filtered data
+expr_combat <- ComBat(dat = log1p(expr_filtered), 
+                      batch = meta$Organ, 
+                      mod = NULL,
+                      par.prior = TRUE, 
+                      prior.plots = FALSE)
+
+cat("✓ Batch correction complete. New matrix 'expr_combat' created.\n")
+
+```
+
+
+
+```{r}
+# ============================================================================
+# 9. PCA - AFTER CORRECTION
+# ============================================================================
+cat("\nStep 9: Running PCA on corrected data...\n")
+
+# Run PCA on the batch-corrected data (already log-scale)
+pca_combat <- prcomp(t(expr_combat), center = TRUE, scale. = TRUE)
+
+# Combine corrected PCA data with metadata
+pca_combat_data <- data.frame(pca_combat$x, meta)
+
+# Plot the new PCA
+ggplot(pca_combat_data, 
+       aes(x = PC1, y = PC2, color = Condition, shape = Organ)) +
+  geom_point(size = 5) +
+  theme_minimal() +
+  labs(title = "PCA After ComBat Correction",
+       subtitle = "Samples now group by 'Condition' (color)",
+       x = "Principal Component 1 (PC1)",
+       y = "Principal Component 2 (PC2)")
+
+cat("✓ Corrected PCA plot generated.\n")
+
+
+```
+
+
+```{r}
+# ============================================================================
+# 10. LOAD ISOFORM DATA WITH TXIMPORT FOR DESEQ2
+# ============================================================================
+cat("\nStep 10: Loading isoform data with tximport for DESeq2...\n")
+
+# Get the list of file paths
+files <- file.path("rsem", sample_ids, paste0(sample_ids, ".isoforms.results"))
+names(files) <- sample_ids
+
+# --- CREATE THE TX2GENE MAP ---
+cat("Building the transcript-to-gene map (tx2gene)...\n")
+
+# Get transcript IDs from one file
+first_file <- read.csv(files[1], sep = "\t", header = TRUE)
+all_transcript_ids <- first_file$transcript_id
+
+# Query biomaRt to map Ensembl Transcript IDs to UniProt Gene IDs
+tx2gene_map <- getBM(
+  attributes = c("ensembl_transcript_id_version", # Col 1: Transcript ID
+                 "uniprot_gn_id"),                # Col 2: Gene ID
+  filters = "ensembl_transcript_id_version",
+  values = all_transcript_ids,
+  mart = ensembl
+)
+
+# Clean the map
+tx2gene_map_clean <- tx2gene_map %>%
+  filter(!is.na(uniprot_gn_id) & uniprot_gn_id != "" &
+           !is.na(ensembl_transcript_id_version) & ensembl_transcript_id_version != "") %>%
+  distinct(ensembl_transcript_id_version, .keep_all = TRUE)
+
+cat(sprintf("✓ Map created: %d transcripts mapped to %d unique genes.\n", 
+            nrow(tx2gene_map_clean), n_distinct(tx2gene_map_clean$uniprot_gn_id)))
+
+# --- RUN TXIMPORT ---
+txi <- tximport(files, 
+                type = "rsem", 
+                tx2gene = tx2gene_map_clean)
+
+cat("✓ Raw count data loaded and summarized to gene level in 'txi' object.\n")
+
+
+```
+
+
+```{r}
+# ============================================================================
+# 11. CREATE FILTER FOR DESEQ2
+# ============================================================================
+cat("\nStep 11: Creating 'expressed' gene filter for DESeq2...\n")
+
+# Use the abundance (TPM) matrix from the 'txi' object
+abundances <- txi$abundance
+
+# Keep genes with TPM >= 1 OR detected in >= 50% of samples
+keep_genes_deseq <- (rowMeans(abundances > 0) >= 0.5) | (rowMeans(abundances) >= 1)
+
+cat(sprintf("✓ DESeq2 filter created, keeping %d genes.\n", sum(keep_genes_deseq)))
+
+
+```
+
+
+```{r}
+# ============================================================================
+# 12. RUN DIFFERENTIAL EXPRESSION ANALYSES
+# ============================================================================
+cat("\nStep 12: Running All DESeq2 Analyses...\n")
+
+# 1. Create the base DDS object
+dds <- DESeqDataSetFromTximport(txi,
+                                colData = meta,
+                                design = ~ Organ + Condition)
+
+# 2. Filter for expressed genes (from Step 11)
+dds_filtered <- dds[keep_genes_deseq, ]
+
+# 3. ANALYSIS 1: Organ Effect
+# Test: Full model (~ Organ + Condition) vs. Reduced (~ Condition)
+cat("  Running Analysis 1: Organ Effect...\n")
+design(dds_filtered) <- ~ Organ + Condition
+dds_org <- DESeq(dds_filtered, test = "LRT", reduced = ~ Condition)
+res_org <- results(dds_org)
+res_org <- res_org[order(res_org$padj), ]
+cat(sprintf("  ✓ Found %d significant genes for Organ effect (padj < 0.1)\n",
+            sum(res_org$padj < 0.1, na.rm=TRUE)))
+
+# 4. ANALYSIS 2: Condition Effect
+# Test: Full model (~ Organ + Condition) vs. Reduced (~ Organ)
+cat("  Running Analysis 2: Condition Effect...\n")
+design(dds_filtered) <- ~ Organ + Condition
+dds_cond <- DESeq(dds_filtered, test = "LRT", reduced = ~ Organ)
+res_cond <- results(dds_cond)
+res_cond <- res_cond[order(res_cond$padj), ]
+cat(sprintf("  ✓ Found %d significant genes for Condition effect (padj < 0.1)\n",
+            sum(res_cond$padj < 0.1, na.rm=TRUE)))
+
+# 5. ANALYSIS 3: Interaction Effect
+# Test: Full model (~ Organ + Condition + Organ:Condition) vs. Reduced (~ Organ + Condition)
+cat("  Running Analysis 3: Interaction Effect...\n")
+design(dds_filtered) <- ~ Organ + Condition + Organ:Condition
+dds_int <- DESeq(dds_filtered, test = "LRT", reduced = ~ Organ + Condition)
+res_int <- results(dds_int)
+res_int <- res_int[order(res_int$padj), ]
+cat(sprintf("  ✓ Found %d significant genes for Interaction effect (padj < 0.1)\n",
+            sum(res_int$padj < 0.1, na.rm=TRUE)))
+
+cat("\n✓ All DESeq2 analyses complete.\n")
+
+```
+
+
+```{r}
+# ============================================================================
+# 13. COMPARE ANALYSIS RESULTS
+# ============================================================================
+cat("\nStep 13: Comparing analysis results...\n")
+
+# 1. Define significant genes (padj < 0.1)
+padj_thresh <- 0.1
+sig_genes_org <- rownames(subset(res_org, padj < padj_thresh))
+sig_genes_cond <- rownames(subset(res_cond, padj < padj_thresh))
+sig_genes_int <- rownames(subset(res_int, padj < padj_thresh))
+
+cat(sprintf("Total Significant Genes (padj < %.2f):\n", padj_thresh))
+cat(sprintf("  - Organ Effect:     %d\n", length(sig_genes_org)))
+cat(sprintf("  - Condition Effect: %d\n", length(sig_genes_cond)))
+cat(sprintf("  - Interaction Effect: %d\n", length(sig_genes_int)))
+
+# 2. Create a list for the Venn diagram
+gene_lists <- list(
+  Organ = sig_genes_org,
+  Condition = sig_genes_cond,
+  Interaction = sig_genes_int
+)
+
+# 3. Generate the Venn diagram
+ggvenn(
+  gene_lists,
+  fill_color = c("#0073C2FF", "#EFC000FF", "#CD534CFF"),
+  stroke_size = 0.5,
+  set_name_size = 4,
+  text_size = 3,
+  show_percentage = FALSE
+) +
+labs(title = "Overlap of Significant Genes (padj < 0.1) Across Analyses")
+
+cat("\n✓ Venn diagram generated.\n")
+
+
+```
+
+```{r}
+# ============================================================================
+# 14. VOLCANO PLOT (ANALYSIS 2: CONDITION EFFECT)
+# ============================================================================
+cat("\nStep 14: Generating Volcano Plot for Condition Effect...\n")
+
+# Extract the specific LFC of "steady_state" vs. "LCMVd8"
+# We use the 'dds_cond' object here
+res_contrast_cond <- results(dds_cond, 
+                             name = "Condition_steady_state_vs_LCMVd8")
+
+# Convert results to a data.frame for ggplot
+res_df_cond <- as.data.frame(res_contrast_cond)
+
+# Merge with gene metadata to get gene symbols
+plot_data_cond <- merge(res_df_cond, meta_genes, by = 0)
+colnames(plot_data_cond)[colnames(plot_data_cond) == "Row.names"] <- "gene_id"
+
+# Create new columns for plotting
+padj_threshold <- 0.1
+logfc_threshold <- 1.0 
+
+plot_data_cond <- plot_data_cond %>%
+  mutate(
+    significance = case_when(
+      padj < padj_threshold & log2FoldChange > logfc_threshold  ~ "Up-regulated in steady_state",
+      padj < padj_threshold & log2FoldChange < -logfc_threshold ~ "Down-regulated in steady_state",
+      TRUE ~ "Not Significant"
+    ),
+    gene_label = if_else(significance != "Not Significant", mgi_symbol, NA_character_)
+  )
+
+# Create the Volcano Plot
+ggplot(plot_data_cond, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = significance), alpha = 0.7) +
+  geom_text_repel(aes(label = gene_label), max.overlaps = 15) +
+  scale_color_manual(values = c("Up-regulated in steady_state" = "red", 
+                                "Down-regulated in steady_state" = "blue", 
+                                "Not Significant" = "grey")) +
+  geom_vline(xintercept = c(-logfc_threshold, logfc_threshold), linetype = "dotted") +
+  geom_hline(yintercept = -log10(padj_threshold), linetype = "dotted") +
+  labs(title = "Volcano Plot: Condition Effect",
+       subtitle = "steady_state vs. LCMVd8 (avg. across Organs)",
+       x = "log2(Fold Change)",
+       y = "-log10(Adjusted P-value)") +
+  theme_minimal()
+
+cat("✓ Condition effect volcano plot generated.\n")
+
+```
+
+
+```{r}
+# ============================================================================
+# 15. VOLCANO PLOT (ANALYSIS 3: INTERACTION EFFECT)
+# ============================================================================
+cat("\nStep 15: Generating Volcano Plot for Interaction Effect...\n")
+
+# Use the results from our 'res_int' object
+res_df_interaction <- as.data.frame(res_int)
+
+# Merge with gene metadata
+plot_data_interaction <- merge(res_df_interaction, meta_genes, by = 0)
+colnames(plot_data_interaction)[colnames(plot_data_interaction) == "Row.names"] <- "gene_id"
+
+# Create new columns for plotting
+plot_data_interaction <- plot_data_interaction %>%
+  mutate(
+    significant_interaction = if_else(padj < padj_threshold, "Significant", "Not Significant"),
+    gene_label = if_else(significant_interaction == "Significant", mgi_symbol, NA_character_)
+  )
+
+# Create the Volcano Plot
+ggplot(plot_data_interaction, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = significant_interaction), alpha = 0.7) +
+  geom_text_repel(aes(label = gene_label), max.overlaps = 15) +
+  scale_color_manual(values = c("Significant" = "darkgreen", 
+                                "Not Significant" = "grey")) +
+  geom_hline(yintercept = -log10(padj_threshold), linetype = "dotted") +
+  labs(title = "Volcano Plot: Interaction Effect (Organ:Condition)",
+       subtitle = "Genes that respond *differently* to infection in Brain vs. Liver",
+       x = "log2(Interaction Effect)",
+       y = "-log10(Adjusted P-value)") +
+  theme_minimal()
+
+cat("✓ Interaction effect volcano plot generated.\n")
+
+
+```
+
+```{r}
+# ============================================================================
+# 16. HEATMAP OF SIGNIFICANT GENES (from Condition Effect)
+# ============================================================================
+cat("\nStep 16: Extracting significant genes and normalizing data...\n")
+
+# Get significant gene IDs from our "Condition Effect" results (res_cond)
+res_cond_df <- as.data.frame(res_cond)
+sig_genes <- subset(res_cond_df, 
+                    padj < padj_threshold & abs(log2FoldChange) > logfc_threshold)
+sig_gene_ids <- rownames(sig_genes)
+
+cat(sprintf("✓ Found %d significant genes (padj < %.2f & LFC > %.1f).\n", 
+            length(sig_gene_ids), padj_threshold, logfc_threshold))
+
+# Get variance-stabilized normalized data from the 'dds_cond' object
+vsd <- vst(dds_cond, blind = FALSE)
+
+# Subset normalized data to include ONLY our significant genes
+sig_vst_data <- assay(vsd)[sig_gene_ids, ]
+
+cat("✓ Created 'sig_vst_data' matrix for heatmap.\n")
+
+
+```
+
+
+```{r}
+# ============================================================================
+# 17. GENERATE HEATMAP
+# ============================================================================
+cat("\nStep 17: Generating heatmap of significant genes...\n")
+
+# Create an annotation data frame for the columns (samples)
+sample_annotation <- data.frame(
+  Condition = meta$Condition,
+  Organ = meta$Organ
+)
+rownames(sample_annotation) <- meta$Run
+
+# Create the heatmap
+pheatmap(
+  sig_vst_data,
+  main = "Heatmap of Significant DEGs (Condition Effect)",
+  color = viridis(100),
+  annotation_col = sample_annotation,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  scale = "row" # Scale by gene (Z-score)
+)
+
+cat("✓ Heatmap generated.\n")
+
+```
+
+
+
+```{r}
+# ============================================================================
+# 18. PREPARE GENE LISTS FOR GO ANALYSIS
+# ============================================================================
+cat("\nStep 18: Preparing gene lists for GO Analysis...\n")
+
+# Get significant UniProt IDs (from Condition Effect)
+sig_uniprot_ids <- sig_gene_ids
+
+# Get "universe" (all expressed genes from our DESeq2 filter)
+# We can use the 'dds_cond' object as it's already filtered
+universe_uniprot_ids <- rownames(dds_cond)
+
+# Convert UniProt IDs to Entrez IDs
+cat("Converting UniProt IDs to Entrez IDs...\n")
+id_map <- bitr(universe_uniprot_ids, 
+               fromType = "UNIPROT",
+               toType = "ENTREZID",
+               OrgDb = org.Mm.eg.db)
+
+# Create final gene lists using Entrez IDs
+sig_entrez_ids <- id_map$ENTREZID[id_map$UNIPROT %in% sig_uniprot_ids]
+universe_entrez_ids <- id_map$ENTREZID
+
+cat(sprintf("✓ Mapped %d significant genes and %d universe genes to Entrez IDs.\n",
+            length(sig_entrez_ids), length(universe_entrez_ids)))
+
+```
+
+
+```{r}
+# ============================================================================
+# 19. RUN GO ENRICHMENT ANALYSIS
+# ============================================================================
+cat("\nStep 19: Running GO Enrichment Analysis...\n")
+
+go_results <- enrichGO(
+  gene = sig_entrez_ids,
+  universe = universe_entrez_ids,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP", # Biological Process
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.1,
+  readable = TRUE # Converts Entrez IDs back to Gene Symbols
+)
+
+cat("✓ GO Analysis complete.\n")
+
+cat("\n--- Top GO Enrichment Results (Biological Process) ---\n")
+print(head(as.data.frame(go_results)))
+
+
+```
+
+
+```{r}
+# ============================================================================
+# 20. VISUALIZE GO RESULTS
+# ============================================================================
+cat("\nStep 20: Generating GO results dot plot...\n")
+
+# Dot plot of top 15 terms
+dotplot(go_results, showCategory = 15) + 
+  labs(title = "Top 15 Enriched GO Terms (Biological Process)")
+
+cat("✓ GO dot plot generated.\n")
+
+```
