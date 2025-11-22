@@ -69,7 +69,7 @@ cat("\nStep 2: Loading RSEM quantification data...\n")
 sample_ids <- metadata$Run
 
 expr <- sapply(sample_ids, function(sample_id){
-  file <- file.path("rsem", sample_id, paste0(sample_id, ".genes.results"))
+  file <- file.path("./rsem_star_threshold_modified/", sample_id, paste0(sample_id, ".genes.results"))
   if (!file.exists(file)) {
     warning(sprintf("File not found: %s", file))
     return(NA)
@@ -288,7 +288,7 @@ cat("✓ Corrected PCA plot generated.\n")
 cat("\nStep 10: Loading isoform data with tximport for DESeq2...\n")
 
 # Get the list of file paths
-files <- file.path("rsem", sample_ids, paste0(sample_ids, ".isoforms.results"))
+files <- file.path("rsem_star_threshold_modified/", sample_ids, paste0(sample_ids, ".isoforms.results"))
 names(files) <- sample_ids
 
 # --- CREATE THE TX2GENE MAP ---
