@@ -8,8 +8,6 @@ format:
         toc: true
 editor_options: 
     chunk_output_type: console
-execute:
-  cache: true
 ---
 
 ```{r setup, include=FALSE}
@@ -34,9 +32,9 @@ library(pheatmap)
 ```
 
 ```{r}
-samples <- list.files("rsem")
+samples <- list.files("rsem_star_threshold_modified")
 expr <- sapply(samples, function(sample){
-  file <- paste0("rsem/",sample,"/", sample, ".genes.results")
+  file <- paste0("rsem_star_threshold_modified//",sample,"/", sample, ".genes.results")
   quant <- read.csv(file, sep="\t", header=T)
   tpm <- setNames(quant$TPM, quant$gene_id)
   return(tpm)
@@ -277,7 +275,7 @@ tx2gene <- getBM(attributes = c("uniprot_gn_id","ensembl_transcript_id_version",
                  mart = ensembl) %>%
   dplyr::select(ensembl_transcript_id_version, ensembl_gene_id, uniprot_gn_id, mgi_symbol)
 
-files <- file.path("rsem", samples, paste0(samples,".isoforms.results"))
+files <- file.path("rsem_star_threshold_modified", samples, paste0(samples,".isoforms.results"))
 txi <- tximport(files, type = "rsem", tx2gene = tx2gene)
 
 dds <- DESeqDataSetFromTximport(txi, colData = meta, design = ~ Organ + condition)
@@ -552,4 +550,44 @@ TODO?
 # res_DESeq2_df <- res_DESeq2_df %>% arrange(padj, desc(abs(log2FoldChange)))
 # write.table(res_DESeq2_df,
 #             file = "res_DESeq2.txt", row.names = F)
+```
+
+## Mapping Quality
+
+```{r}
+library(tidyverse)
+
+plot_mapping_rate <- function(mapping_stat_file, t) {
+  mapping <- read_lines(mapping_stat_file) %>% 
+  as_tibble()
+
+mapping <- mapping %>%
+  separate(value, into = c("Filename", "Content"), sep = ":", extra = "merge") %>%
+  separate(Content, into = c("Metric", "Value"), sep = "\\|") %>%
+    mutate(across(everything(), trimws))
+  mapping$Sample <- str_extract(mapping$Filename, "SRR\\d+")
+  mapping$Type <- ifelse(str_detect(mapping$Metric, "%"), "Percentage", "Count")
+  mapping$Metric <- str_remove(mapping$Metric, "(Number|%) of reads unmapped: ")
+  
+  mapping %>%
+    filter(Type == "Percentage") %>%
+    ggplot(aes(x = Sample, y = as.numeric(str_remove(Value, "%")), fill = Metric)) +
+    geom_col(position = "dodge") +
+    labs(
+      title = paste("Unmapped Reads: ", t),
+      y = "Percentage of Total Reads",
+      x = "Sample",
+      fill = "Reason"
+    ) + ylim(0,72) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+
+```
+
+```{r}
+plot_mapping_rate("./mapping_stat_modified_threshold.txt", "STAR modified settings")
+plot_mapping_rate("./mapping_stat.txt", "STAR default settings")
+
+
 ```
